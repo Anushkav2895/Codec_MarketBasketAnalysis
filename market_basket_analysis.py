@@ -1,123 +1,151 @@
-# # Market Basket Analysis (Grocery Transactions)
-# **Goal:** Find products that are often bought together, so a retailer can improve cross-selling, store layout and promotions.
-#
-# **Dataset:** [Groceries Dataset (Kaggle)](https://www.kaggle.com/datasets/heeraldedhia/groceries-dataset) - columns `Member_number`, `Date`, `itemDescription`.
-#
-# **Algorithms:** Apriori and FP-Growth (via `mlxtend`)
-# **Key measures:** support, confidence, lift
+"""Market Basket Analysis on grocery transactions (Apriori vs FP-Growth).
 
-import os
+Run from anywhere:  python market_basket_analysis.py
+Needs data/Groceries_dataset.csv  (get it with: python data/download_data.py)
+Outputs: images/*.png, strong_rules.csv, rules_all.csv, runtime_comparison.csv
+"""
+import sys
 import time
 import warnings
+from pathlib import Path
+from statistics import median
+
+import matplotlib
+matplotlib.use("Agg")  # save charts to files, no pop-up windows
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import seaborn as sns
+from mlxtend.frequent_patterns import apriori, association_rules, fpgrowth
 from mlxtend.preprocessing import TransactionEncoder
-from mlxtend.frequent_patterns import apriori, fpgrowth, association_rules
 
 warnings.filterwarnings("ignore")
 sns.set_theme(style="whitegrid")
-os.makedirs("images", exist_ok=True)
 
-# ## 1. Load and inspect the data
-# Download `Groceries_dataset.csv` from Kaggle and place it in a `data/` folder.
+# ---------- Paths (relative to this file, so it works from any folder) ----------
+BASE_DIR = Path(__file__).resolve().parent
+DATA_FILE = BASE_DIR / "data" / "Groceries_dataset.csv"
+IMAGES_DIR = BASE_DIR / "images"
+IMAGES_DIR.mkdir(exist_ok=True)
 
-df = pd.read_csv("data/Groceries_dataset.csv")
-print(df.shape)
-print(df.head())
+# ---------- Settings ----------
+MIN_SUPPORT = 0.002          # used for the rules below
+SUPPORT_LEVELS = [0.005, 0.003, 0.002]   # compared in the runtime test
+N_RUNS = 3                   # repeats per algorithm and support level
+STRONG_MIN_CONFIDENCE = 0.05
+STRONG_MIN_LIFT = 1.2
 
-df.info()
-print("Missing values:\n", df.isna().sum())
-print("Duplicate rows:", df.duplicated().sum())
+if not DATA_FILE.exists():
+    sys.exit(f"Dataset not found: {DATA_FILE}\nRun first: python data/download_data.py")
 
-# ## 2. Build transactions
-# There is no invoice number, so one **transaction = one customer on one date** (`Member_number` + `Date`). Duplicate rows are kept as one item per basket because we only care whether an item is present.
+# ---------- 1. Load and clean ----------
+df = pd.read_csv(DATA_FILE)
+print("Rows:", df.shape[0], "| Columns:", list(df.columns))
+print("Missing values:", int(df.isna().sum().sum()), "| Duplicate rows:", int(df.duplicated().sum()))
 
+df = df.dropna(subset=["Member_number", "Date", "itemDescription"])
 df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
 df["itemDescription"] = df["itemDescription"].str.strip().str.lower()
 
+# One transaction = one customer on one date (no invoice ID in this dataset).
+# Duplicate items inside a basket are collapsed because we only need presence/absence.
 transactions = (
     df.groupby(["Member_number", "Date"])["itemDescription"]
     .apply(lambda s: sorted(set(s)))
     .tolist()
 )
+n_tx = len(transactions)
+print("Transactions:", n_tx, "| Unique items:", df["itemDescription"].nunique(),
+      "| Avg basket size:", round(float(np.mean([len(t) for t in transactions])), 2))
 
-print("Number of transactions:", len(transactions))
-print("Unique items:", df["itemDescription"].nunique())
-print("Average basket size:", round(np.mean([len(t) for t in transactions]), 2))
-print("Example basket:", transactions[0])
-
-# ## 3. Exploratory analysis
-# ### 3.1 Best-selling items
-
+# ---------- 2. EDA charts ----------
 top_items = df["itemDescription"].value_counts().head(15)
-
 plt.figure(figsize=(9, 6))
 sns.barplot(x=top_items.values, y=top_items.index, palette="viridis")
 plt.title("Top 15 most purchased items")
 plt.xlabel("Number of purchases")
 plt.ylabel("")
 plt.tight_layout()
-plt.savefig("images/01_top_items.png", dpi=150)
+plt.savefig(IMAGES_DIR / "01_top_items.png", dpi=150)
 plt.close()
 
-# ### 3.2 Basket size and monthly trend
-
 fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
-
 sizes = pd.Series([len(t) for t in transactions])
 sns.countplot(x=sizes, color="#4C78A8", ax=axes[0])
 axes[0].set_title("Basket size (items per transaction)")
 axes[0].set_xlabel("Items in basket")
-
 monthly = df.groupby(df["Date"].dt.to_period("M")).size()
 monthly.plot(ax=axes[1], marker="o", color="#D1495B")
 axes[1].set_title("Items sold per month")
 axes[1].set_xlabel("")
-
 plt.tight_layout()
-plt.savefig("images/02_basket_size_monthly.png", dpi=150)
+plt.savefig(IMAGES_DIR / "02_basket_size_monthly.png", dpi=150)
 plt.close()
 
-# ## 4. Encode transactions
-# Apriori and FP-Growth need a one-hot table: one row per transaction, one True/False column per item.
-
+# ---------- 3. Encode baskets ----------
 te = TransactionEncoder()
 basket = pd.DataFrame(te.fit(transactions).transform(transactions), columns=te.columns_)
-print(basket.shape)
-print(basket.head())
 
-# ## 5. Frequent itemsets (Apriori vs FP-Growth)
-# Support is the share of transactions that contain an itemset. In grocery data most pairs are rare, so the support threshold has to be low. **If you get too few or too many rules, change `MIN_SUPPORT`.**
+# ---------- 4. Apriori vs FP-Growth (same data, same settings) ----------
+def timed(func, min_support):
+    start = time.perf_counter()
+    result = func(basket, min_support=min_support, use_colnames=True)
+    return time.perf_counter() - start, result
 
-MIN_SUPPORT = 0.002
+runtime_rows = []
+fi_fp = None
+for support in SUPPORT_LEVELS:
+    ap_times, fp_times = [], []
+    for run in range(N_RUNS):
+        # alternate which algorithm goes first so neither always runs "cold"
+        if run % 2 == 0:
+            t_ap, fi_ap = timed(apriori, support)
+            t_fp, fi_fp_run = timed(fpgrowth, support)
+        else:
+            t_fp, fi_fp_run = timed(fpgrowth, support)
+            t_ap, fi_ap = timed(apriori, support)
+        ap_times.append(t_ap)
+        fp_times.append(t_fp)
+    same = set(fi_ap["itemsets"]) == set(fi_fp_run["itemsets"])
+    runtime_rows.append({
+        "min_support": support,
+        "n_itemsets": len(fi_fp_run),
+        "apriori_median_s": round(median(ap_times), 3),
+        "fpgrowth_median_s": round(median(fp_times), 3),
+        "same_itemsets": same,
+    })
+    if support == MIN_SUPPORT:
+        fi_fp = fi_fp_run
 
-t0 = time.time()
-fi_apriori = apriori(basket, min_support=MIN_SUPPORT, use_colnames=True)
-t_apriori = time.time() - t0
+runtime_df = pd.DataFrame(runtime_rows)
+runtime_df.to_csv(BASE_DIR / "runtime_comparison.csv", index=False)
+print("\nRuntime comparison (median of", N_RUNS, "runs, same data and settings):")
+print(runtime_df.to_string(index=False))
+if not runtime_df["same_itemsets"].all():
+    print("WARNING: Apriori and FP-Growth returned different itemsets.")
 
-t0 = time.time()
-fi_fp = fpgrowth(basket, min_support=MIN_SUPPORT, use_colnames=True)
-t_fp = time.time() - t0
+x = np.arange(len(runtime_df))
+plt.figure(figsize=(8, 5))
+plt.bar(x - 0.2, runtime_df["apriori_median_s"], 0.4, label="Apriori", color="#4C78A8")
+plt.bar(x + 0.2, runtime_df["fpgrowth_median_s"], 0.4, label="FP-Growth", color="#F58518")
+plt.xticks(x, [f"{s}\n({n} itemsets)" for s, n in zip(runtime_df["min_support"], runtime_df["n_itemsets"])])
+plt.xlabel("Minimum support (number of frequent itemsets found)")
+plt.ylabel("Median runtime (seconds)")
+plt.title(f"Apriori vs FP-Growth runtime (median of {N_RUNS} runs)")
+plt.legend()
+plt.tight_layout()
+plt.savefig(IMAGES_DIR / "07_runtime_comparison.png", dpi=150)
+plt.close()
 
-print(f"Apriori:   {len(fi_apriori)} itemsets in {t_apriori:.2f}s")
-print(f"FP-Growth: {len(fi_fp)} itemsets in {t_fp:.2f}s")
+# ---------- 5. Frequent itemsets ----------
+frequent = fi_fp.copy()
+frequent["length"] = frequent["itemsets"].apply(len)
+frequent["itemset_str"] = frequent["itemsets"].apply(lambda s: " + ".join(sorted(s)))
+print("\nFrequent itemsets by size (min_support =", MIN_SUPPORT, "):")
+print(frequent["length"].value_counts().sort_index().to_string())
 
-frequent_itemsets = fi_fp.copy()
-frequent_itemsets["length"] = frequent_itemsets["itemsets"].apply(len)
-frequent_itemsets["itemset_str"] = frequent_itemsets["itemsets"].apply(lambda s: " + ".join(sorted(s)))
-print(frequent_itemsets["length"].value_counts().sort_index())
-
-# Both algorithms return the same itemsets; FP-Growth is usually faster on larger data. We continue with the FP-Growth output.
-#
-# ### 5.1 Visualise frequent itemsets
-
-top_single = frequent_itemsets[frequent_itemsets["length"] == 1].nlargest(15, "support")
-top_multi = frequent_itemsets[frequent_itemsets["length"] >= 2].nlargest(15, "support")
-
+top_single = frequent[frequent["length"] == 1].nlargest(15, "support")
+top_multi = frequent[frequent["length"] >= 2].nlargest(15, "support")
 fig, axes = plt.subplots(1, 2, figsize=(15, 6))
 sns.barplot(data=top_single, x="support", y="itemset_str", palette="Blues_r", ax=axes[0])
 axes[0].set_title("Top single items by support")
@@ -126,72 +154,58 @@ sns.barplot(data=top_multi, x="support", y="itemset_str", palette="Oranges_r", a
 axes[1].set_title("Top frequent itemsets (2+ items)")
 axes[1].set_ylabel("")
 plt.tight_layout()
-plt.savefig("images/03_frequent_itemsets.png", dpi=150)
+plt.savefig(IMAGES_DIR / "03_frequent_itemsets.png", dpi=150)
 plt.close()
 
-# ## 6. Association rules
-# For a rule *A -> B*:
-# - **Support:** how often A and B appear together
-# - **Confidence:** of the baskets with A, the share that also contain B
-# - **Lift:** how much more often A and B occur together than if they were independent. Lift > 1 means a real positive association.
+# ---------- 6. Association rules ----------
+try:
+    rules = association_rules(fi_fp, metric="lift", min_threshold=1.0)
+except TypeError:  # newer mlxtend versions need num_itemsets
+    rules = association_rules(fi_fp, num_itemsets=n_tx, metric="lift", min_threshold=1.0)
 
-def build_rules(itemsets, n_transactions):
-    try:
-        return association_rules(itemsets, metric="lift", min_threshold=1.0)
-    except TypeError:  # newer mlxtend versions need num_itemsets
-        return association_rules(itemsets, num_itemsets=n_transactions,
-                                 metric="lift", min_threshold=1.0)
-
-rules = build_rules(fi_fp, len(basket))
 rules["antecedents_str"] = rules["antecedents"].apply(lambda s: ", ".join(sorted(s)))
 rules["consequents_str"] = rules["consequents"].apply(lambda s: ", ".join(sorted(s)))
 rules["rule"] = rules["antecedents_str"] + "  ->  " + rules["consequents_str"]
+rules["baskets"] = (rules["support"] * n_tx).round().astype(int)  # baskets containing both sides
+print("\nRules with lift > 1:", len(rules), "| baskets analysed:", n_tx)
 
-print("Number of rules with lift > 1:", len(rules))
+cols = ["rule", "support", "confidence", "lift", "baskets"]
+rules[["antecedents_str", "consequents_str", "support", "confidence", "lift", "baskets"]] \
+    .sort_values("lift", ascending=False).round(4).to_csv(BASE_DIR / "rules_all.csv", index=False)
 
-cols = ["rule", "support", "confidence", "lift"]
 print("\nTop 15 rules by lift:")
 print(rules.sort_values("lift", ascending=False)[cols].head(15).round(4).to_string(index=False))
 
-# ### 6.1 Strongest rules
-# We keep rules that are both reasonably reliable (confidence) and clearly positive (lift). Adjust the thresholds if the table comes out empty.
-
-strong = rules[(rules["confidence"] >= 0.05) & (rules["lift"] >= 1.2)]
+strong = rules[(rules["confidence"] >= STRONG_MIN_CONFIDENCE) & (rules["lift"] >= STRONG_MIN_LIFT)]
 strong = strong.sort_values(["lift", "confidence"], ascending=False)
-print("Strong rules:", len(strong))
-print("\nStrongest rules:")
-print(strong[cols].head(15).round(4).to_string(index=False))
-strong[cols].round(4).to_csv("strong_rules.csv", index=False)
-print("Saved strong_rules.csv")
+print(f"\nStrong rules (confidence >= {STRONG_MIN_CONFIDENCE}, lift >= {STRONG_MIN_LIFT}):", len(strong))
+print(strong[cols].round(4).to_string(index=False))
+strong[cols].round(4).to_csv(BASE_DIR / "strong_rules.csv", index=False)
 
-# ### 6.2 Support vs confidence, coloured by lift
-
+# Scatter: support vs confidence, coloured by lift
 plt.figure(figsize=(9, 6))
-sc = plt.scatter(rules["support"], rules["confidence"], c=rules["lift"],
-                 cmap="viridis", s=60, alpha=0.8, edgecolor="k", linewidth=0.3)
+sc = plt.scatter(rules["support"], rules["confidence"], c=rules["lift"], cmap="viridis",
+                 s=60, alpha=0.8, edgecolor="k", linewidth=0.3)
 plt.colorbar(sc, label="Lift")
-plt.xlabel("Support")
+plt.xlabel("Support (share of baskets containing both items)")
 plt.ylabel("Confidence")
 plt.title("Association rules: support vs confidence")
 plt.tight_layout()
-plt.savefig("images/04_rules_scatter.png", dpi=150)
+plt.savefig(IMAGES_DIR / "04_rules_scatter.png", dpi=150)
 plt.close()
 
-# ### 6.3 Top rules by lift
-
+# Top rules by lift
 top_rules = strong.head(12) if len(strong) >= 5 else rules.nlargest(12, "lift")
-
 plt.figure(figsize=(10, 6))
 sns.barplot(data=top_rules, x="lift", y="rule", palette="magma")
 plt.title("Top association rules by lift")
 plt.xlabel("Lift")
 plt.ylabel("")
 plt.tight_layout()
-plt.savefig("images/05_top_rules_lift.png", dpi=150)
+plt.savefig(IMAGES_DIR / "05_top_rules_lift.png", dpi=150)
 plt.close()
 
-# ### 6.4 Lift heatmap (single item -> single item)
-
+# Lift heatmap (single item -> single item)
 single = rules[(rules["antecedents"].apply(len) == 1) & (rules["consequents"].apply(len) == 1)]
 if len(single) > 0:
     pivot = single.pivot_table(index="antecedents_str", columns="consequents_str", values="lift")
@@ -203,25 +217,8 @@ if len(single) > 0:
     plt.xlabel("Consequent (bought next)")
     plt.ylabel("Antecedent (already in basket)")
     plt.tight_layout()
-    plt.savefig("images/06_lift_heatmap.png", dpi=150)
+    plt.savefig(IMAGES_DIR / "06_lift_heatmap.png", dpi=150)
     plt.close()
-else:
-    print("No single-item rules found. Try lowering MIN_SUPPORT.")
 
-# ## 7. Business insights
-# *(Check these against your own tables and charts before publishing. Replace the examples with the real pairs you see.)*
-#
-# 1. **Bundle offers:** put the highest-lift pairs in the "Strongest rules" table into combo deals or "frequently bought together" prompts.
-# 2. **Store layout:** place items with strong associations near each other, so a customer picking up the first is reminded of the second.
-# 3. **Targeted promotions:** discount the high-traffic item (such as whole milk or other vegetables) and promote its associated item at full price.
-# 4. **Online recommendations:** use rules with high confidence as a simple "customers also bought" feature on the website or app.
-# 5. **Stock planning:** items that appear in many strong rules should never run out, because a missing item can lose the whole basket.
-#
-# **Limitations:** a transaction here is defined as customer + date, the data covers a limited period, and rules show association, not causation. Test any promotion with an A/B experiment before rolling it out.
-
-# ## 8. Conclusion
-# Apriori and FP-Growth found the same frequent itemsets, and association rules (filtered by lift and confidence) reveal which products are bought together. These can feed bundles, shelf placement, and recommendations.
-#
-# **Possible next steps:** analyse rules by season or customer segment, add profit margins to rank rules by value, and build a small recommendation function that takes a basket and suggests the next item.
-
-print("\nDone. Charts are in the images folder.")
+print("\nDone. Charts are in:", IMAGES_DIR)
+print("Saved: strong_rules.csv, rules_all.csv, runtime_comparison.csv")

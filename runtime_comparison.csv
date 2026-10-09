@@ -1,0 +1,4 @@
+min_support,n_itemsets,apriori_median_s,fpgrowth_median_s,same_itemsets
+0.005,126,0.292,0.17,True
+0.003,216,0.459,0.175,True
+0.002,330,0.603,0.185,True

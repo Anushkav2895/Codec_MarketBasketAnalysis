@@ -1,7 +1,7 @@
-rule,support,confidence,lift
-curd  ->  sausage,0.0029,0.0873,1.4466
-brown bread  ->  canned beer,0.0024,0.0639,1.3629
-canned beer  ->  brown bread,0.0024,0.0513,1.3629
-frozen vegetables  ->  sausage,0.0021,0.074,1.226
-bottled beer  ->  sausage,0.0033,0.0737,1.222
-sausage  ->  bottled beer,0.0033,0.0554,1.222
+rule,support,confidence,lift,baskets
+curd  ->  sausage,0.0029,0.0873,1.4466,44
+brown bread  ->  canned beer,0.0024,0.0639,1.3629,36
+canned beer  ->  brown bread,0.0024,0.0513,1.3629,36
+frozen vegetables  ->  sausage,0.0021,0.074,1.226,31
+bottled beer  ->  sausage,0.0033,0.0737,1.222,50
+sausage  ->  bottled beer,0.0033,0.0554,1.222,50
