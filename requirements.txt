@@ -2,5 +2,5 @@ pandas
 numpy
 matplotlib
 seaborn
-mlxtend
-jupyter
+mlxtend==0.25.0
+kagglehub

@@ -1,10 +1,32 @@
-import kagglehub, shutil, os
+import shutil
+import sys
+from pathlib import Path
 
-path = kagglehub.dataset_download("heeraldedhia/groceries-dataset")
-print("Path to dataset files:", path)
+DATASET = "heeraldedhia/groceries-dataset"
+FILE_NAME = "Groceries_dataset.csv"
+DATA_DIR = Path(__file__).resolve().parent
+TARGET = DATA_DIR / FILE_NAME
 
-os.makedirs("data", exist_ok=True)
-for f in os.listdir(path):
-    if f.endswith(".csv"):
-        shutil.copy(os.path.join(path, f), os.path.join("data", f))
-        print("Copied:", f)
+if TARGET.exists():
+    print(f"{FILE_NAME} already exists in {DATA_DIR}. Nothing to do.")
+    sys.exit(0)
+
+try:
+    import kagglehub
+except ImportError:
+    sys.exit("kagglehub is not installed. Run: pip install -r requirements.txt")
+
+try:
+    source = Path(kagglehub.dataset_download(DATASET)) / FILE_NAME
+except Exception as exc:
+    sys.exit(
+        f"Download failed: {exc}\n"
+        f"Manual option: download the dataset from https://www.kaggle.com/datasets/{DATASET} "
+        f"and place {FILE_NAME} in {DATA_DIR}"
+    )
+
+if not source.exists():
+    sys.exit(f"{FILE_NAME} was not found in the downloaded files.")
+
+shutil.copy(source, TARGET)
+print(f"Copied {FILE_NAME} to {TARGET}")
